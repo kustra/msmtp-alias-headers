@@ -1,0 +1,31 @@
+name: test
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -I test_msmtp_alias_headers.py -v
+
+  # The system Python the script runs on in practice, whose patch level setup-python never tests.
+  distro:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: ["debian:12", "debian:13", "ubuntu:22.04", "ubuntu:24.04", "ubuntu:26.04"]
+    container: ${{ matrix.image }}
+    steps:
+      - uses: actions/checkout@v7
+      - run: apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y python3
+      - run: /usr/bin/python3 -I test_msmtp_alias_headers.py -v

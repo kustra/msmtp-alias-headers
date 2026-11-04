@@ -1,0 +1,189 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# msmtp-alias-headers: a sendmail for msmtp that rewrites local addresses in To, Cc and Bcc.
+# Copyright (C) 2026 László Kustra
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+"""A sendmail for msmtp that also rewrites local addresses in the To, Cc and Bcc headers.
+
+msmtp's aliases change only the envelope, and a header address without a domain
+("To: root") makes servers such as Amazon SES reject the mail ("554 Transaction
+failed: Missing final '@domain'"). Each such address is expanded through
+/etc/aliases by msmtp's rules; then msmtp runs with this command's arguments.
+Every other byte passes unchanged. If the rewrite fails, the message goes to
+msmtp unchanged, so the mail fares no worse than with msmtp alone.
+"""
+
+import functools
+import inspect
+import os
+import subprocess
+import sys
+import syslog
+from email.utils import formataddr, getaddresses
+
+ALIASES = "/etc/aliases"
+MSMTP = "/usr/bin/msmtp"
+FIELDS = {b"to", b"cc", b"bcc"}
+# msmtp's own limits (src/aliases.c: MAXLINE, MAXTOKS, MAXDEPTH).
+MAX_LINE = 512
+MAX_TARGETS = 32
+MAX_DEPTH = 16
+# With these msmtp sends nothing and reads no message.
+NON_SENDING = {"--version", "--help", "-P", "--pretend", "-S", "--serverinfo", "--configure", "--rmqs"}
+NON_SENDING_PREFIXES = ("--configure=", "--rmqs=")
+EX_UNAVAILABLE = 69
+# Without the CVE-2023-27043 fix, getaddresses can read one address as two recipients.
+STRICT_PARSER = "strict" in inspect.signature(getaddresses).parameters
+
+
+def is_local(address):
+    return address != "" and "@" not in address
+
+
+def load_aliases(path):
+    """Read an aliases file as msmtp does, raising where msmtp reports an error.
+
+    An empty target raises too: msmtp would pass it on as an empty recipient, which no server accepts.
+    """
+    aliases = {}
+    with open(path, "rb") as file:
+        for number, raw in enumerate(file, 1):
+            if len(raw) >= MAX_LINE - 1:
+                raise ValueError(f"{path}:{number}: longer than {MAX_LINE - 1} characters")
+            line = raw.decode("utf-8", "surrogateescape").split("#", 1)[0]
+            if not line.strip():
+                continue
+            parts = line.split(":")
+            if len(parts) != 2:
+                raise ValueError(f"{path}:{number}: single ':' delimiter expected")
+            local = parts[0].strip()
+            targets = [target.strip() for target in parts[1].split(",")[:MAX_TARGETS]]
+            if not is_local(local):
+                raise ValueError(f"{path}:{number}: invalid alias {local!r}")
+            if local in aliases:
+                raise ValueError(f"{path}:{number}: duplicate alias {local!r}")
+            if "" in targets:
+                raise ValueError(f"{path}:{number}: empty address in alias {local!r}")
+            aliases[local] = targets
+    return aliases
+
+
+def expand(address, aliases, depth=0):
+    """msmtp's rules: an unlisted local address takes `default`'s targets, or stays as it is without one."""
+    if depth > MAX_DEPTH:
+        raise ValueError(f"too many redirects when expanding alias {address!r}")
+    targets = aliases.get(address, aliases.get("default"))
+    if targets is None:
+        return [address]
+    return [
+        result
+        for target in targets
+        for result in (expand(target, aliases, depth + 1) if is_local(target) else [target])
+    ]
+
+
+def has_group(value):
+    """Whether an address list holds a group ("admins: a, b;"), whose name a rebuilt field would lose."""
+    quoted = escaped = False
+    comment = angle = 0
+    for char in value:
+        if escaped:
+            escaped = False
+        elif char == "\\" and (quoted or comment):
+            escaped = True
+        elif quoted:
+            quoted = char != '"'
+        elif char == "(":
+            comment += 1
+        elif comment:
+            comment -= char == ")"
+        elif char == '"':
+            quoted = True
+        elif char == "<":
+            angle += 1
+        elif char == ">":
+            angle = max(angle - 1, 0)
+        elif char == ":" and not angle:
+            return True
+    return False
+
+
+def rewrite_field(field, aliases):
+    name, _, value = field.partition(":")
+    eol = field[len(field.rstrip("\r\n")):]
+    value = value.replace("\r", "").replace("\n", "")
+    if has_group(value):
+        return field
+    if not STRICT_PARSER:
+        raise RuntimeError("this Python's email.utils.getaddresses lacks the CVE-2023-27043 fix")
+    pairs = getaddresses([value], strict=True)
+    # An empty address is a part the parser gave up on; rebuilding the field would drop it.
+    if not pairs or any(not address for _, address in pairs) or not any(is_local(a) for _, a in pairs):
+        return field
+    table = aliases()
+    parts = [
+        formataddr((display, target))
+        for display, address in pairs
+        for target in (expand(address, table) if is_local(address) else [address])
+    ]
+    return f"{name}: {', '.join(parts)}{eol}"
+
+
+def rewrite(message, aliases):
+    """`aliases` returns the alias table; it is called only once a field holds a local address."""
+    lines = message.splitlines(keepends=True)
+    end = next((i for i, line in enumerate(lines) if line in (b"\n", b"\r\n")), len(lines))
+    fields = []
+    for line in lines[:end]:
+        if line[:1] in (b" ", b"\t") and fields:
+            fields[-1] += line
+        else:
+            fields.append(line)
+    for i, field in enumerate(fields):
+        if field.split(b":", 1)[0].strip().lower() in FIELDS:
+            text = field.decode("utf-8", "surrogateescape")
+            fields[i] = rewrite_field(text, aliases).encode("utf-8", "surrogateescape")
+    return b"".join(fields + lines[end:])
+
+
+def warn(text):
+    print(f"msmtp-alias-headers: {text}", file=sys.stderr)
+    syslog.openlog("msmtp-alias-headers", 0, syslog.LOG_MAIL)
+    syslog.syslog(syslog.LOG_WARNING, text)
+
+
+def main(argv, aliases_path=ALIASES, msmtp=MSMTP):
+    if any(arg in NON_SENDING or arg.startswith(NON_SENDING_PREFIXES) for arg in argv):
+        try:
+            os.execv(msmtp, [msmtp, *argv])
+        except OSError as error:
+            warn(f"cannot run {msmtp}: {error}")
+            return EX_UNAVAILABLE
+    message = sys.stdin.buffer.read()
+    try:
+        message = rewrite(message, functools.cache(lambda: load_aliases(aliases_path)))
+    except Exception as error:
+        warn(f"{error}; passing the message to msmtp unchanged")
+    try:
+        status = subprocess.run([msmtp, *argv], input=message).returncode
+    except OSError as error:
+        warn(f"cannot run {msmtp}: {error}")
+        return EX_UNAVAILABLE
+    return 128 - status if status < 0 else status
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
